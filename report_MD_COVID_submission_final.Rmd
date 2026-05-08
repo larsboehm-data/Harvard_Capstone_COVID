@@ -1,0 +1,480 @@
+---
+title: "HarvardX PH125.9x Data Science - Capstone Project"
+subtitle: "Predicting Cumulative COVID-19 Incidence in Germany from Demographic and Regional Features"
+author: "Lars Böhm, MD"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5
+)
+
+set.seed(2026)
+
+required_pkgs <- c("tidyverse", "data.table", "caret", "randomForest", "knitr")
+
+# Automatically install missing packages as requested in the project rubric.
+for (pkg in required_pkgs) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(caret)
+  library(randomForest)
+  library(knitr)
+})
+```
+
+# Project Scope and Academic Integrity Statement
+
+This project is the Choose-Your-Own component of the HarvardX PH125.9x Data Science Capstone. It is separate from the MovieLens project and uses a public-health dataset rather than a recommender-system dataset. The modelling task is to predict **cumulative COVID-19 incidence per 100,000 inhabitants** across German federal-state, gender, and age-group strata.
+
+The analysis is intentionally limited to a small number of interpretable predictors. It should therefore be read as a retrospective epidemiological modelling exercise, not as a prospective clinical forecasting model. The goal is to demonstrate a reproducible machine-learning workflow: data access, cleaning, feature engineering, train/test evaluation, baseline comparison, model interpretation, and transparent limitations.
+
+Generative AI assistance was used for RMarkdown formatting, code review, and debugging suggestions. The final interpretation, project framing, submission responsibility, and verification of the code and results remain with the author.
+
+
+# Motivation and Clinical Background
+
+As a physician in internal medicine training, I was interested in using the HarvardX PH125.9x Capstone project to connect newly learned data-science methods with a medical topic that shaped clinical work during the last several years. COVID-19 was not only a global public-health crisis, but also a disease that affected everyday hospital medicine, risk communication, resource allocation, and the way clinicians interpreted population-level data.
+
+The intention behind this project was therefore personal and educational: I wanted to retrospectively revisit German COVID-19 data and analyze it with the tools introduced throughout the Data Science program. Instead of treating the dataset as a purely technical exercise, I approached it as a physician asking a simple epidemiological question: how much of the variation in cumulative reported COVID-19 incidence can be described by basic demographic and regional variables such as age group, gender, and federal state?
+
+This project is not intended to produce a clinically validated prediction model. It does not attempt to predict individual patient outcomes, estimate hospital mortality, or provide real-time outbreak forecasts. The available data are aggregated and do not contain individual-level clinical variables such as comorbidities, symptoms, vaccination status, treatment, laboratory values, or hospitalization status. For that reason, the modelling target was deliberately limited to cumulative incidence per 100,000 inhabitants in demographic and regional strata.
+
+From a learning perspective, the project allowed me to practice the main components of a reproducible machine-learning workflow: automatic data access, data cleaning, harmonization of epidemiological and demographic tables, feature engineering, exploratory visualization, train/test splitting, baseline comparison, regression modelling, random forest modelling, RMSE-based evaluation, and careful discussion of limitations. The medical relevance of the topic helped make the statistical workflow more meaningful to me as a physician, while the constraints of the dataset also served as a useful reminder that technically successful models are not automatically clinically useful models.
+
+# Data Sources and Access
+
+The analysis uses two files hosted in the accompanying public GitHub repository:
+
+1. `covid_de.csv.zip`: compressed German COVID-19 case data.
+2. `demographics_de.csv`: population denominators by federal state, gender, and age group.
+
+The COVID-19 case file corresponds to the public `covid_de.csv` data used in the "COVID-19 Tracking Germany" Kaggle dataset and described by the Heads or Tails data-preparation article. That article describes the German case data as originating from the Robert Koch Institute and being made available through the National Platform for Geographic Data. The project repository mirrors the two files used here so that the R script and this report can download the exact input files automatically.
+
+```{r data-source-table}
+source_table <- tibble::tibble(
+  file = c("covid_de.csv.zip", "demographics_de.csv"),
+  role = c(
+    "COVID-19 case counts by state, county, age group, gender, and date",
+    "Population denominators by state, gender, and age group"
+  ),
+  access = c(
+    "Automatically downloaded from the project GitHub repository",
+    "Automatically downloaded from the project GitHub repository"
+  )
+)
+
+knitr::kable(source_table, caption = "Data files used by the report and the accompanying R script.")
+```
+
+```{r data-download}
+url_repo <- "https://github.com/larsboehm-data/Harvard_Capstone_COVID"
+url_inf  <- "https://raw.githubusercontent.com/larsboehm-data/Harvard_Capstone_COVID/main/covid_de.csv.zip"
+url_demo <- "https://raw.githubusercontent.com/larsboehm-data/Harvard_Capstone_COVID/main/demographics_de.csv"
+
+# Helper: read a zipped CSV directly from GitHub.
+load_zipped_github_csv <- function(url) {
+  zip_file <- tempfile(fileext = ".zip")
+  extract_dir <- tempfile(pattern = "covid_zip_")
+  dir.create(extract_dir, recursive = TRUE, showWarnings = FALSE)
+
+  on.exit(unlink(c(zip_file, extract_dir), recursive = TRUE, force = TRUE), add = TRUE)
+
+  download_ok <- tryCatch({
+    utils::download.file(url, zip_file, mode = "wb", quiet = TRUE)
+    TRUE
+  }, error = function(e) e)
+
+  if (inherits(download_ok, "error")) {
+    stop("Could not download ", url, ": ", conditionMessage(download_ok))
+  }
+
+  zip_contents <- unzip(zip_file, list = TRUE)
+  csv_files <- zip_contents$Name[grepl("\\.csv$", zip_contents$Name, ignore.case = TRUE)]
+
+  if (length(csv_files) == 0) {
+    stop("No CSV file found inside the downloaded ZIP archive.")
+  }
+
+  csv_path <- unzip(zip_file, files = csv_files[1], exdir = extract_dir)
+  data.table::fread(csv_path)
+}
+
+# Helper: download plain-text CSV content from GitHub.
+read_url_text <- function(url) {
+  tmp_file <- tempfile(fileext = ".csv")
+  on.exit(unlink(tmp_file, force = TRUE), add = TRUE)
+
+  download_ok <- tryCatch({
+    utils::download.file(url, tmp_file, mode = "wb", quiet = TRUE)
+    TRUE
+  }, error = function(e) e)
+
+  if (inherits(download_ok, "error")) {
+    stop("Could not download ", url, ": ", conditionMessage(download_ok))
+  }
+
+  paste(readLines(tmp_file, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
+}
+
+# Helper: read demographics CSV. If the hosted file is accidentally stored as
+# one long line, repair row breaks before parsing.
+load_demographics_csv <- function(url) {
+  txt <- read_url_text(url)
+  txt <- gsub("\\r\\n|\\r", "\n", txt)
+
+  n_lines <- length(strsplit(txt, "\n", fixed = TRUE)[[1]])
+
+  if (n_lines <= 2) {
+    federal_states <- c(
+      "Baden-Wuerttemberg", "Bayern", "Berlin", "Brandenburg", "Bremen",
+      "Hamburg", "Hessen", "Mecklenburg-Vorpommern", "Niedersachsen",
+      "Nordrhein-Westfalen", "Rheinland-Pfalz", "Saarland", "Sachsen",
+      "Sachsen-Anhalt", "Schleswig-Holstein", "Thueringen"
+    )
+
+    row_boundary <- paste0(" (?=(", paste(federal_states, collapse = "|"), "),(female|male),)")
+    txt <- gsub(row_boundary, "\n", txt, perl = TRUE)
+  }
+
+  data.table::fread(text = txt)
+}
+
+covid_data <- load_zipped_github_csv(url_inf)
+demo_data  <- load_demographics_csv(url_demo)
+```
+
+```{r data-overview}
+case_date_range <- c(NA, NA)
+if ("date" %in% names(covid_data)) {
+  case_date_range <- tryCatch(
+    range(as.Date(covid_data$date), na.rm = TRUE),
+    error = function(e) c(NA, NA)
+  )
+}
+
+overview_table <- tibble::tibble(
+  dataset = c("COVID case data", "Demographic data"),
+  rows = c(nrow(covid_data), nrow(demo_data)),
+  columns = c(ncol(covid_data), ncol(demo_data))
+)
+
+knitr::kable(overview_table, caption = "Raw data dimensions after automatic download.")
+
+if (!all(is.na(case_date_range))) {
+  date_table <- tibble::tibble(
+    metric = c("Earliest case date", "Latest case date"),
+    value = as.character(case_date_range)
+  )
+  knitr::kable(date_table, caption = "Date range of the COVID-19 case file.")
+}
+```
+
+# Data Cleaning and Feature Engineering
+
+The target variable is cumulative incidence per 100,000 inhabitants:
+
+$$
+\text{Incidence} = \frac{\text{Total cases}}{\text{Population}} \times 100{,}000
+$$
+
+This is **not** a 7-day incidence. Cases are aggregated over the available observation period within each federal-state, gender, and age-group stratum.
+
+```{r data-cleaning}
+required_covid_cols <- c("state", "age_group", "gender", "cases")
+required_demo_cols  <- c("state", "age_group", "gender", "population")
+
+missing_covid_cols <- setdiff(required_covid_cols, names(covid_data))
+missing_demo_cols  <- setdiff(required_demo_cols, names(demo_data))
+
+if (length(missing_covid_cols) > 0) {
+  stop("Missing columns in covid_data: ", paste(missing_covid_cols, collapse = ", "))
+}
+
+if (length(missing_demo_cols) > 0) {
+  stop("Missing columns in demo_data: ", paste(missing_demo_cols, collapse = ", "))
+}
+
+clean_state <- function(x) {
+  x <- stringr::str_squish(as.character(x))
+  x <- stringr::str_replace_all(
+    x,
+    c(
+      "Ä" = "Ae", "Ö" = "Oe", "Ü" = "Ue",
+      "ä" = "ae", "ö" = "oe", "ü" = "ue", "ß" = "ss"
+    )
+  )
+  stringr::str_to_lower(x)
+}
+
+clean_key <- function(x) {
+  stringr::str_to_lower(stringr::str_squish(as.character(x)))
+}
+
+clean_gender <- function(x) {
+  x <- clean_key(x)
+  dplyr::case_when(
+    x %in% c("f", "female", "weiblich", "w") ~ "female",
+    x %in% c("m", "male", "maennlich", "männlich") ~ "male",
+    TRUE ~ x
+  )
+}
+
+cases_prep <- covid_data %>%
+  mutate(
+    state = clean_state(state),
+    age_group = clean_key(age_group),
+    gender = clean_gender(gender),
+    cases = as.numeric(cases)
+  ) %>%
+  filter(gender %in% c("female", "male"), !is.na(age_group)) %>%
+  group_by(state, gender, age_group) %>%
+  summarise(total_cases = sum(cases, na.rm = TRUE), .groups = "drop")
+
+demo_prep <- demo_data %>%
+  mutate(
+    state = clean_state(state),
+    age_group = clean_key(age_group),
+    gender = clean_gender(gender),
+    population = as.numeric(population)
+  ) %>%
+  filter(gender %in% c("female", "male"), !is.na(population), population > 0)
+
+unmatched_cases <- anti_join(cases_prep, demo_prep, by = c("state", "gender", "age_group"))
+
+final_df <- cases_prep %>%
+  inner_join(demo_prep, by = c("state", "gender", "age_group")) %>%
+  mutate(incidence = (total_cases / population) * 100000) %>%
+  mutate(across(c(state, gender, age_group), as.factor))
+
+if (nrow(final_df) == 0) {
+  stop("The joined data set is empty. Check state, gender, and age-group coding.")
+}
+
+if (any(is.na(final_df$incidence))) {
+  stop("Incidence contains missing values after joining case and population data.")
+}
+```
+
+```{r join-summary}
+join_summary <- tibble::tibble(
+  metric = c(
+    "Aggregated case strata",
+    "Population strata",
+    "Matched modelling strata",
+    "Unmatched case strata"
+  ),
+  value = c(
+    nrow(cases_prep),
+    nrow(demo_prep),
+    nrow(final_df),
+    nrow(unmatched_cases)
+  )
+)
+
+knitr::kable(join_summary, caption = "Join diagnostics after harmonising state, gender, and age-group labels.")
+```
+
+# Exploratory Analysis
+
+The final modelling dataset contains `r nrow(final_df)` strata. Each row represents one combination of federal state, gender, and age group.
+
+```{r incidence-summary}
+summary_table <- final_df %>%
+  summarise(
+    min_incidence = min(incidence),
+    median_incidence = median(incidence),
+    mean_incidence = mean(incidence),
+    max_incidence = max(incidence)
+  )
+
+knitr::kable(summary_table, digits = 2, caption = "Summary of cumulative incidence per 100,000 inhabitants.")
+```
+
+```{r incidence-by-age, fig.cap="Distribution of cumulative incidence by age group."}
+ggplot(final_df, aes(x = age_group, y = incidence)) +
+  geom_boxplot() +
+  labs(
+    x = "Age group",
+    y = "Cumulative incidence per 100,000 inhabitants",
+    title = "Cumulative COVID-19 Incidence by Age Group"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r incidence-by-state, fig.cap="Mean cumulative incidence by federal state."}
+state_summary <- final_df %>%
+  group_by(state) %>%
+  summarise(mean_incidence = mean(incidence), .groups = "drop") %>%
+  arrange(desc(mean_incidence))
+
+ggplot(state_summary, aes(x = reorder(state, mean_incidence), y = mean_incidence)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = "Federal state",
+    y = "Mean cumulative incidence per 100,000 inhabitants",
+    title = "Mean Cumulative COVID-19 Incidence by Federal State"
+  ) +
+  theme_minimal()
+```
+
+# Machine-Learning Models
+
+Three models were evaluated on the same 80/20 train/test split:
+
+1. A mean-baseline model that predicts the training-set mean incidence for every test observation.
+2. A main-effects linear regression model.
+3. A random forest regression model using federal state, gender, and age group as predictors.
+
+Model performance was evaluated using root mean squared error (RMSE) on the holdout test set.
+
+```{r model-training}
+set.seed(2026)
+test_index <- caret::createDataPartition(
+  y = final_df$incidence,
+  times = 1,
+  p = 0.20,
+  list = FALSE
+)
+
+train_set <- final_df[-test_index, , drop = FALSE]
+test_set  <- final_df[ test_index, , drop = FALSE]
+
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+baseline_prediction <- mean(train_set$incidence)
+baseline_predictions <- rep(baseline_prediction, nrow(test_set))
+baseline_rmse <- rmse(test_set$incidence, baseline_predictions)
+
+fit_lm <- stats::lm(incidence ~ state + gender + age_group, data = train_set)
+lm_predictions <- as.numeric(predict(fit_lm, newdata = test_set))
+lm_rmse <- rmse(test_set$incidence, lm_predictions)
+
+fit_rf <- randomForest::randomForest(
+  incidence ~ state + gender + age_group,
+  data = train_set,
+  ntree = 500,
+  importance = TRUE
+)
+
+rf_predictions <- as.numeric(predict(fit_rf, newdata = test_set))
+rf_rmse <- rmse(test_set$incidence, rf_predictions)
+
+mean_test_incidence <- mean(test_set$incidence)
+relative_error <- function(model_rmse) {
+  if (mean_test_incidence == 0) {
+    return(NA_real_)
+  }
+  100 * model_rmse / mean_test_incidence
+}
+
+results <- tibble::tibble(
+  model = c("Mean baseline", "Linear regression", "Random forest"),
+  rmse = c(baseline_rmse, lm_rmse, rf_rmse),
+  relative_error_percent = c(
+    relative_error(baseline_rmse),
+    relative_error(lm_rmse),
+    relative_error(rf_rmse)
+  )
+) %>%
+  arrange(rmse)
+
+best_model <- results$model[1]
+```
+
+# Results
+
+The best-performing model in this split was **`r best_model`**. The random forest achieved an RMSE of `r round(rf_rmse, 2)` on the holdout test set. The mean-baseline RMSE was `r round(baseline_rmse, 2)`, and the linear regression RMSE was `r round(lm_rmse, 2)`.
+
+```{r model-results}
+knitr::kable(results, digits = 2, caption = "Model performance on the holdout test set, sorted by RMSE.")
+```
+
+```{r observed-vs-predicted, fig.cap="Observed versus random-forest-predicted cumulative incidence in the holdout test set."}
+prediction_plot_df <- tibble::tibble(
+  observed = test_set$incidence,
+  predicted = rf_predictions
+)
+
+ggplot(prediction_plot_df, aes(x = observed, y = predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    x = "Observed cumulative incidence per 100,000",
+    y = "Predicted cumulative incidence per 100,000",
+    title = "Observed vs Predicted Incidence: Random Forest"
+  ) +
+  theme_minimal()
+```
+
+```{r feature-importance, fig.cap="Random forest variable importance."}
+randomForest::varImpPlot(
+  fit_rf,
+  main = "Predictive Power of Demographic Variables"
+)
+```
+
+```{r feature-importance-table}
+importance_df <- as.data.frame(randomForest::importance(fit_rf))
+importance_df$feature <- rownames(importance_df)
+importance_df <- importance_df %>% relocate(feature)
+
+if ("IncNodePurity" %in% names(importance_df)) {
+  importance_df <- importance_df %>% arrange(desc(IncNodePurity))
+}
+
+knitr::kable(importance_df, digits = 2, caption = "Random forest variable importance table.")
+```
+
+# Discussion
+
+This analysis estimates how much variation in cumulative COVID-19 incidence can be described using only age group, gender, and federal state. Age group and federal state are plausible predictors because infection exposure, testing behaviour, mobility, public-health restrictions, and population structure varied across demographic and regional strata.
+
+The model comparison is important because a random forest should not be interpreted in isolation. The mean baseline shows the error of a model with no demographic or regional information, while the linear regression provides a simple parametric comparison using the same predictors. The random forest can capture non-linear structure and interactions between factor levels, but its flexibility is limited by the small number of aggregated strata.
+
+The outcome should be interpreted cautiously. It is cumulative incidence over the available observation period, not a prospective forecast and not a 7-day incidence. From a clinical perspective, this distinction is essential: a model that describes aggregated historical incidence is fundamentally different from a tool that could guide bedside decisions, triage, treatment, or hospital resource planning. The model also omits calendar time, vaccination status, viral variants, testing intensity, mobility, socioeconomic variables, local containment policies, and changes in reporting practice. These omitted variables limit the model's clinical and policy usefulness.
+
+Despite these limitations, the project demonstrates a reproducible machine-learning workflow that is suitable for the capstone format: automatic data download, transparent data cleaning, feature engineering, train/test validation, baseline comparison, model evaluation using RMSE, and interpretation of variable importance.
+
+# Conclusion
+
+A model using federal state, gender, and age group can describe broad demographic and regional variation in cumulative COVID-19 incidence in Germany. In this setting, predictive performance should be understood as retrospective stratified prediction rather than real-time outbreak forecasting. For me as a physician, the main value of the project was not the creation of a deployable medical model, but the structured application of data-science methods to a clinically familiar public-health problem. Future work could extend the approach by adding time-varying predictors and evaluating 7-day incidence with temporally separated training and test periods.
+
+# References and Acknowledgements
+
+- Heads or Tails. "Animations in the time of Coronavirus." Blog post describing the preparation of the German COVID-19 tracking dataset and linking to the Kaggle dataset `covid_de.csv`. https://heads0rtai1s.github.io/2020/04/30/animate-map-covid/
+- Kaggle. "COVID-19 Tracking Germany" dataset by Heads or Tails. https://www.kaggle.com/datasets/headsortails/covid19-tracking-germany
+- Robert Koch Institute. German COVID-19 surveillance data, as referenced in the dataset preparation article. https://www.rki.de/
+- Project data repository used for this submission: https://github.com/larsboehm-data/Harvard_Capstone_COVID
+- R packages used in the analysis include `tidyverse`, `data.table`, `caret`, `randomForest`, `knitr`, and `rmarkdown`.
+- OpenAI ChatGPT was used as a limited support tool for RMarkdown formatting, language refinement, code review, and debugging assistance on May 8, 2026. The research question, medical interpretation, final code review, and submission responsibility remain with the author.
+
+# Reproducibility Information
+
+```{r session-info}
+sessionInfo()
+```
